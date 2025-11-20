@@ -24,6 +24,7 @@ ASSETS_DIR = os.path.join(CURRENT_DIR, "assets")
 SPEAKER_JSON_PATH = os.path.join(ASSETS_DIR, "speaker.json")
 tts = None
 speaker_dict: Dict[str, List[str]] = {}
+speaker_json_mtime: Optional[float] = None
 
 def ensure_assets_dir():
     os.makedirs(ASSETS_DIR, exist_ok=True)
@@ -46,6 +47,26 @@ def save_speaker_data():
     ensure_assets_dir()
     with open(SPEAKER_JSON_PATH, "w", encoding="utf-8") as f:
         json.dump(speaker_dict, f, indent=4, ensure_ascii=False)
+    global speaker_json_mtime
+    speaker_json_mtime = os.path.getmtime(SPEAKER_JSON_PATH)
+
+def reload_speaker_data_if_stale(force: bool = False):
+    global speaker_json_mtime
+    if force:
+        speaker_dict.clear()
+        speaker_dict.update(load_speaker_data())
+        speaker_json_mtime = os.path.getmtime(SPEAKER_JSON_PATH)
+        return
+
+    try:
+        current_mtime = os.path.getmtime(SPEAKER_JSON_PATH)
+    except OSError:
+        current_mtime = None
+
+    if current_mtime is None or speaker_json_mtime != current_mtime:
+        speaker_dict.clear()
+        speaker_dict.update(load_speaker_data())
+        speaker_json_mtime = current_mtime
 
 def resolve_asset_path(path: str) -> str:
     if os.path.isabs(path):
@@ -74,8 +95,7 @@ async def lifespan(app: FastAPI):
         gpu_memory_utilization=args.gpu_memory_utilization,
         qwenemo_gpu_memory_utilization=args.qwenemo_gpu_memory_utilization,
     )
-    speaker_dict.clear()
-    speaker_dict.update(load_speaker_data())
+    reload_speaker_data_if_stale(force=True)
     yield
 
 
@@ -179,6 +199,7 @@ async def tts_api_url(request: Request):
 @app.get("/audio/voices")
 async def tts_voices():
     """Return the available speaker list."""
+    reload_speaker_data_if_stale()
     return speaker_dict
 
 
@@ -194,6 +215,7 @@ async def tts_api_openai(request: Request):
         text = data["input"]
         voice = data["voice"]
 
+        reload_speaker_data_if_stale()
         spk_audio_path = get_speaker_audio_path(voice)
         if spk_audio_path is None:
             return JSONResponse(
