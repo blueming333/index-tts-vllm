@@ -11,14 +11,59 @@ import argparse
 import json
 import time
 import soundfile as sf
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
+import uuid
 
 from loguru import logger
 logger.add("logs/api_server_v2.log", rotation="10 MB", retention=10, level="DEBUG", enqueue=True)
 
 from indextts.infer_vllm_v2 import IndexTTS2
 
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+ASSETS_DIR = os.path.join(CURRENT_DIR, "assets")
+SPEAKER_JSON_PATH = os.path.join(ASSETS_DIR, "speaker.json")
 tts = None
+speaker_dict: Dict[str, List[str]] = {}
+
+def ensure_assets_dir():
+    os.makedirs(ASSETS_DIR, exist_ok=True)
+
+def load_speaker_data() -> Dict[str, List[str]]:
+    ensure_assets_dir()
+    if not os.path.exists(SPEAKER_JSON_PATH):
+        with open(SPEAKER_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump({}, f, indent=4, ensure_ascii=False)
+    try:
+        with open(SPEAKER_JSON_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return {k: v for k, v in data.items() if isinstance(v, list)}
+    except Exception:
+        pass
+    return {}
+
+def save_speaker_data():
+    ensure_assets_dir()
+    with open(SPEAKER_JSON_PATH, "w", encoding="utf-8") as f:
+        json.dump(speaker_dict, f, indent=4, ensure_ascii=False)
+
+def resolve_asset_path(path: str) -> str:
+    if os.path.isabs(path):
+        return path
+    normalized = os.path.normpath(os.path.join(CURRENT_DIR, path))
+    return normalized
+
+def get_speaker_audio_path(voice: str) -> Optional[str]:
+    paths = speaker_dict.get(voice)
+    if not paths:
+        return None
+    for candidate in paths:
+        resolved = resolve_asset_path(candidate)
+        if os.path.exists(resolved):
+            return resolved
+    # fallback to first even if file currently missing
+    return resolve_asset_path(paths[0])
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -29,6 +74,8 @@ async def lifespan(app: FastAPI):
         gpu_memory_utilization=args.gpu_memory_utilization,
         qwenemo_gpu_memory_utilization=args.qwenemo_gpu_memory_utilization,
     )
+    speaker_dict.clear()
+    speaker_dict.update(load_speaker_data())
     yield
 
 
@@ -126,6 +173,102 @@ async def tts_api_url(request: Request):
                 "status": "error",
                 "error": str(tb_str)
             }
+        )
+
+
+@app.get("/audio/voices")
+async def tts_voices():
+    """Return the available speaker list."""
+    return speaker_dict
+
+
+@app.post("/audio/speech", responses={
+    200: {"content": {"application/octet-stream": {}}},
+    404: {"content": {"application/json": {}}},
+    500: {"content": {"application/json": {}}}
+})
+async def tts_api_openai(request: Request):
+    """OpenAI compatible speech endpoint."""
+    try:
+        data = await request.json()
+        text = data["input"]
+        voice = data["voice"]
+
+        spk_audio_path = get_speaker_audio_path(voice)
+        if spk_audio_path is None:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "status": "error",
+                    "error": f"voice `{voice}` not found, please upload or register first."
+                }
+            )
+
+        global tts
+        sr, wav = await tts.infer(
+            spk_audio_prompt=spk_audio_path,
+            text=text,
+            output_path=None,
+        )
+
+        with io.BytesIO() as wav_buffer:
+            sf.write(wav_buffer, wav, sr, format="WAV")
+            wav_bytes = wav_buffer.getvalue()
+
+        return Response(content=wav_bytes, media_type="audio/wav")
+
+    except Exception as ex:
+        tb_str = "".join(traceback.format_exception(type(ex), ex, ex.__traceback__))
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "error": str(tb_str)
+            }
+        )
+
+
+@app.post("/audio/upload", responses={
+    200: {"content": {"application/json": {}}},
+    400: {"content": {"application/json": {}}},
+    500: {"content": {"application/json": {}}}
+})
+async def tts_upload_voice(speaker: str = Form(...), file: UploadFile = File(...)):
+    """Upload a WAV file and bind it to a speaker."""
+    if file.content_type not in {"audio/wav", "audio/x-wav"}:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": "only WAV files are supported"}
+        )
+
+    try:
+        ensure_assets_dir()
+        filename = f"{speaker}_{uuid.uuid4().hex[:8]}.wav"
+        target_path = os.path.join(ASSETS_DIR, filename)
+        file_data = await file.read()
+        with open(target_path, "wb") as out_f:
+            out_f.write(file_data)
+
+        rel_path = os.path.relpath(target_path, CURRENT_DIR).replace(os.sep, "/")
+        speaker_paths = speaker_dict.setdefault(speaker, [])
+        if rel_path not in speaker_paths:
+            speaker_paths.append(rel_path)
+            save_speaker_data()
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "success",
+                "speaker": speaker,
+                "audio_paths": speaker_paths
+            }
+        )
+
+    except Exception as ex:
+        tb_str = "".join(traceback.format_exception(type(ex), ex, ex.__traceback__))
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error": str(tb_str)}
         )
 
 
